@@ -15,11 +15,11 @@ import (
 	"github.com/omegaatt36/karakeep-tg/internal/service/notify"
 )
 
-const dedupeWindow = 24 * time.Hour
+const dedupeWindow = time.Hour
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		if err := healthcheck(context.Background(), "http://127.0.0.1:"+portFrom(os.Getenv)+"/ready"); err != nil {
+		if err := healthcheck(context.Background(), "http://127.0.0.1:"+portFrom(os.Getenv)+"/health"); err != nil {
 			fmt.Fprintln(os.Stderr, "unhealthy:", err)
 			os.Exit(1)
 		}
@@ -53,14 +53,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create notify service: %w", err)
 	}
-	server, err := webhook.New(webhook.Options{Token: cfg.webhookToken, Notifier: notifier})
-	if err != nil {
-		return fmt.Errorf("create webhook server: %w", err)
-	}
-
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", ":"+cfg.port)
 	if err != nil {
 		return fmt.Errorf("listen on port %s: %w", cfg.port, err)
+	}
+	server, err := webhook.New(webhook.Options{Token: cfg.webhookToken, Notifier: notifier})
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("create webhook server: %w", err)
 	}
 	slog.InfoContext(ctx, "listening", "addr", ln.Addr().String())
 	return server.Serve(ctx, ln)

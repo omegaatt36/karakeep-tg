@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,9 +16,7 @@ func env(overrides map[string]string) func(string) string {
 		"TELEGRAM_CHAT_IDS":  "123, -1001234567890 ,@channel",
 		"WEBHOOK_TOKEN":      "webhook-token",
 	}
-	for k, v := range overrides {
-		values[k] = v
-	}
+	maps.Copy(values, overrides)
 	return func(key string) string { return values[key] }
 }
 

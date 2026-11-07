@@ -1,6 +1,10 @@
 package telegram_test
 
 import (
+	"encoding/xml"
+	"errors"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -54,7 +58,7 @@ func TestRender(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := telegram.Render(tt.msg); got != tt.want {
+			if got := telegram.Render(tt.msg); !slices.Equal(got, []string{tt.want}) {
 				t.Fatalf("Render() = %q, want %q", got, tt.want)
 			}
 		})
@@ -81,53 +85,101 @@ func TestRenderDecodesOnlyTheDisplayedURL(t *testing.T) {
 			got := telegram.Render(domain.Message{URL: tt.url})
 
 			wantHref := strings.NewReplacer("&", "&amp;").Replace(tt.url)
-			if want := link(wantHref, tt.wantDisplay); got != want {
+			if want := link(wantHref, tt.wantDisplay); !slices.Equal(got, []string{want}) {
 				t.Fatalf("Render() = %q, want %q", got, want)
 			}
 		})
 	}
 }
 
-func TestRenderTruncatesOnlyTheSummary(t *testing.T) {
-	tests := []struct {
-		name    string
-		summary string
-	}{
-		{"ascii", strings.Repeat("a", 10000)},
-		{"cjk", strings.Repeat("字", 5000)},
-		{"surrogate pairs", strings.Repeat("😀", 3000)},
-		{"escape heavy", strings.Repeat("<", 5000)},
+func plainText(t *testing.T, parts []string) string {
+	t.Helper()
+	var text strings.Builder
+	for i, part := range parts {
+		var parsed strings.Builder
+		decoder := xml.NewDecoder(strings.NewReader("<root>" + part + "</root>"))
+		for {
+			token, err := decoder.Token()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("part %d has invalid HTML: %v", i, err)
+			}
+			if data, ok := token.(xml.CharData); ok {
+				parsed.Write(data)
+			}
+		}
+		if n := utf16Len(parsed.String()); n > messageLimit {
+			t.Fatalf("part %d length = %d, want <= %d", i, n, messageLimit)
+		}
+		text.WriteString(parsed.String())
+	}
+	return text.String()
+}
+
+func TestRenderSplitsWithoutLosingContent(t *testing.T) {
+	tests := []struct{ name, title, url, summary string }{
+		{"long summary", "Title", "https://e.com/a", strings.Repeat("a", 10000)},
+		{"long title", strings.Repeat("標題", 5000), "https://e.com/a", "summary"},
+		{"long url", "Title", "https://e.com/" + strings.Repeat("x", 10000), "summary"},
+		{"unicode and escapes", strings.Repeat("<😀&字>\"", 900), "https://e.com/%e8%a6%81?x=1&y=2", strings.Repeat("&<😀字>\"", 2000)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			msg := domain.Message{Title: "Title", URL: "https://e.com/a", Summary: tt.summary}
-			head := "<b>Title</b>\n" + link("https://e.com/a", "https://e.com/a") + "\n\n"
-
+			msg := domain.Message{Title: tt.title, URL: tt.url, Summary: tt.summary}
 			got := telegram.Render(msg)
-
-			if n := utf16Len(got); n > messageLimit {
-				t.Fatalf("length = %d UTF-16 units, want <= %d", n, messageLimit)
+			if len(got) < 2 {
+				t.Fatalf("parts = %d, want multiple", len(got))
 			}
-			if !strings.HasPrefix(got, head) {
-				t.Fatalf("title and url were altered: %.60q", got)
-			}
-			if !strings.HasSuffix(got, "…") {
-				t.Fatalf("truncated message does not end with an ellipsis")
-			}
-			if utf16Len(got) < messageLimit-8 {
-				t.Fatalf("length = %d, truncated more than needed", utf16Len(got))
+			display := strings.ReplaceAll(tt.url, "%e8%a6%81", "要")
+			if want := tt.title + "\n" + display + "\n\n" + tt.summary; plainText(t, got) != want {
+				t.Fatal("split changed or lost content")
 			}
 		})
 	}
 }
 
 func TestRenderKeepsSummaryThatFitsExactly(t *testing.T) {
-	head := "<b>T</b>\n" + link("https://e.com/a", "https://e.com/a") + "\n\n"
-	summary := strings.Repeat("a", messageLimit-utf16Len(head))
+	title, url := "T", "https://e.com/a"
+	summary := strings.Repeat("a", messageLimit-utf16Len(title+"\n"+url+"\n\n"))
+	got := telegram.Render(domain.Message{Title: title, URL: url, Summary: summary})
+	want := "<b>T</b>\n" + link(url, url) + "\n\n" + summary
+	if !slices.Equal(got, []string{want}) {
+		t.Fatal("summary that fits was split or changed")
+	}
+}
 
-	got := telegram.Render(domain.Message{Title: "T", URL: "https://e.com/a", Summary: summary})
+func TestRenderReplacesInvalidUTF8WithoutPanicking(t *testing.T) {
+	got := telegram.Render(domain.Message{Title: "title\xff", URL: "https://e.com/\xff", Summary: "summary\xff"})
+	if want := "title�\nhttps://e.com/�\n\nsummary�"; plainText(t, got) != want {
+		t.Fatalf("got %q, want %q", plainText(t, got), want)
+	}
+}
 
-	if got != head+summary {
-		t.Fatalf("a summary that fits was truncated (len %d)", utf16Len(got))
+func TestRenderDropsWhitespaceOnlyParts(t *testing.T) {
+	url := "https://e.com/a"
+	summary := strings.Repeat("a", messageLimit-utf16Len(url+"\n\n")) + "\n"
+	parts := telegram.Render(domain.Message{URL: url, Summary: summary})
+	if len(parts) != 1 {
+		t.Fatalf("trailing newline emitted %d parts, want 1", len(parts))
+	}
+	if got, want := plainText(t, parts), url+"\n\n"+strings.TrimSuffix(summary, "\n"); got != want {
+		t.Fatal("visible part changed")
+	}
+	preserved := domain.Message{Title: "  Title \t", URL: url, Summary: "\n  summary  \t"}
+	if got, want := plainText(t, telegram.Render(preserved)), preserved.Title+"\n"+url+"\n\n"+preserved.Summary; got != want {
+		t.Fatal("whitespace in visible parts changed")
+	}
+	for _, msg := range []domain.Message{
+		{Title: strings.Repeat(" ", 5000), URL: "https://e.com/a"},
+		{URL: strings.Repeat(" ", 5000), Summary: "visible"},
+		{Title: strings.Repeat(" ", 5000), URL: strings.Repeat(" ", 5000), Summary: strings.Repeat(" ", 5000)},
+	} {
+		for _, part := range telegram.Render(msg) {
+			if text := plainText(t, []string{part}); strings.TrimSpace(text) == "" {
+				t.Fatalf("whitespace-only rendered part: %q", part)
+			}
+		}
 	}
 }

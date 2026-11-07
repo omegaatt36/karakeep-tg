@@ -33,8 +33,14 @@ type Service struct {
 	summaryTimeout time.Duration
 	dedupeWindow   time.Duration
 
-	mu      sync.Mutex
-	claimed map[string]time.Time
+	mu          sync.Mutex
+	claimed     map[string]claim
+	nextCleanup time.Time
+}
+
+type claim struct {
+	completedAt time.Time
+	inFlight    bool
 }
 
 func New(opts Options) (*Service, error) {
@@ -57,7 +63,7 @@ func New(opts Options) (*Service, error) {
 		pollInterval:   opts.PollInterval,
 		summaryTimeout: opts.SummaryTimeout,
 		dedupeWindow:   opts.DedupeWindow,
-		claimed:        make(map[string]time.Time),
+		claimed:        make(map[string]claim),
 	}, nil
 }
 
@@ -70,6 +76,9 @@ func (s *Service) Handle(ctx context.Context, bookmarkID string) error {
 		s.release(bookmarkID)
 		return err
 	}
+	s.mu.Lock()
+	s.claimed[bookmarkID] = claim{completedAt: time.Now()}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -129,15 +138,18 @@ func (s *Service) claim(bookmarkID string) bool {
 	defer s.mu.Unlock()
 
 	now := time.Now()
-	for id, at := range s.claimed {
-		if now.Sub(at) >= s.dedupeWindow {
-			delete(s.claimed, id)
+	if !now.Before(s.nextCleanup) {
+		for id, entry := range s.claimed {
+			if !entry.inFlight && now.Sub(entry.completedAt) >= s.dedupeWindow {
+				delete(s.claimed, id)
+			}
 		}
+		s.nextCleanup = now.Add(min(time.Minute, s.dedupeWindow))
 	}
-	if _, ok := s.claimed[bookmarkID]; ok {
+	if entry, ok := s.claimed[bookmarkID]; ok && (entry.inFlight || now.Sub(entry.completedAt) < s.dedupeWindow) {
 		return false
 	}
-	s.claimed[bookmarkID] = now
+	s.claimed[bookmarkID] = claim{inFlight: true}
 	return true
 }
 

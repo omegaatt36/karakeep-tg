@@ -15,7 +15,7 @@ import (
 const (
 	pollInterval   = 5 * time.Second
 	summaryTimeout = 5 * time.Minute
-	dedupeWindow   = 24 * time.Hour
+	dedupeWindow   = time.Hour
 )
 
 type stubBookmarkSource struct {
@@ -300,6 +300,50 @@ func TestHandleStopsWhenContextCanceled(t *testing.T) {
 		}
 		if got := len(notifier.messages()); got != 0 {
 			t.Fatalf("sent %d messages after cancel, want 0", got)
+		}
+	})
+}
+
+func TestHandleDedupeWindowStartsAfterDelivery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &stubBookmarkSource{
+			responses: []domain.Bookmark{bookmark(domain.SummarySuccess, "s")},
+			release:   make(chan struct{}),
+		}
+		notifier := &spyNotifier{}
+		svc := newService(t, source, notifier)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			if err := svc.Handle(t.Context(), "b1"); err != nil {
+				t.Errorf("Handle: %v", err)
+			}
+		})
+		synctest.Wait()
+		time.Sleep(dedupeWindow + time.Second)
+		wg.Go(func() {
+			if err := svc.Handle(t.Context(), "b1"); err != nil {
+				t.Errorf("duplicate Handle: %v", err)
+			}
+		})
+		synctest.Wait()
+		close(source.release)
+		wg.Wait()
+		if got := source.callCount(); got != 1 {
+			t.Fatalf("active bookmark fetched %d times, want 1", got)
+		}
+		time.Sleep(dedupeWindow - time.Second)
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(notifier.messages()); got != 1 {
+			t.Fatalf("sent %d within completion TTL, want 1", got)
+		}
+		time.Sleep(2 * time.Second)
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(notifier.messages()); got != 2 {
+			t.Fatalf("sent %d after completion TTL, want 2", got)
 		}
 	})
 }

@@ -1,0 +1,47 @@
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task: fmt
+      - task: lint
+      - task: test
+
+  fmt:
+    cmds:
+      - go tool golangci-lint fmt
+      - go mod tidy
+
+  lint:
+    cmds:
+      - go vet -all ./...
+      - go tool golangci-lint run
+
+  test:
+    cmds:
+      - go test ./... -race
+
+  vuln:
+    cmds:
+      - go tool govulncheck ./...
+
+  live:
+    desc: Contract test against a real Karakeep (needs KARAKEEP_URL, KARAKEEP_API_KEY, LIVE_BOOKMARK_ID)
+    cmds:
+      - LIVE_KARAKEEP=1 go test ./internal/repository/karakeep -run TestLiveBookmarkContract -count=1 -v
+
+  build:
+    cmds:
+      - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/karakeep-tg ./cmd/karakeep-tg
+
+  run:
+    dotenv: [".env"]
+    cmds:
+      - go run ./cmd/karakeep-tg
+
+  image:
+    desc: Build the multi-arch binaries and a local image
+    cmds:
+      - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o karakeep-tg-amd64 ./cmd/karakeep-tg
+      - GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o karakeep-tg-arm64 ./cmd/karakeep-tg
+      - docker build -f build/karakeep-tg/Dockerfile -t ghcr.io/omegaatt36/karakeep-tg:dev .

@@ -76,11 +76,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
+	var errs []error
 	select {
 	case err := <-serveErr:
-		s.cancelJobs()
-		s.jobs.Wait()
-		return fmt.Errorf("serve webhook: %w", err)
+		errs = append(errs, fmt.Errorf("serve webhook: %w", err))
 	case <-ctx.Done():
 	}
 
@@ -88,10 +87,20 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown webhook server: %w", err)
+		errs = append(errs, fmt.Errorf("shutdown webhook server: %w", err))
 	}
-	s.jobs.Wait()
-	return nil
+
+	jobsDone := make(chan struct{})
+	go func() {
+		s.jobs.Wait()
+		close(jobsDone)
+	}()
+	select {
+	case <-jobsDone:
+	case <-shutdownCtx.Done():
+		errs = append(errs, errors.New("wait for in-flight notifications: shutdown timed out"))
+	}
+	return errors.Join(errs...)
 }
 
 type webhookEvent struct {
@@ -116,12 +125,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusAccepted)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		slog.WarnContext(r.Context(), "flush webhook acknowledgement", "bookmark_id", event.BookmarkID, "error", err)
+	}
+
 	s.jobs.Go(func() {
 		if err := s.notifier.Handle(s.jobsCtx, event.BookmarkID); err != nil {
 			slog.ErrorContext(s.jobsCtx, "handle crawled bookmark", "bookmark_id", event.BookmarkID, "error", err)
 		}
 	})
-	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) authorized(r *http.Request) bool {

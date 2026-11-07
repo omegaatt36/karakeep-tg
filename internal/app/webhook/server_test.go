@@ -76,28 +76,38 @@ func TestWebhookRejectsUnauthenticatedRequests(t *testing.T) {
 	tests := []struct {
 		name          string
 		authorization string
+		body          string
 	}{
-		{"missing header", ""},
-		{"wrong scheme", "Basic " + token},
-		{"bare token", token},
-		{"wrong token", "Bearer wrong"},
-		{"token prefix", "Bearer " + token[:4]},
-		{"token with suffix", "Bearer " + token + "x"},
-		{"empty bearer", "Bearer "},
+		{"missing header", "", crawledBody("b1")},
+		{"wrong scheme", "Basic " + token, crawledBody("b1")},
+		{"lowercase scheme", "bearer " + token, crawledBody("b1")},
+		{"bare token", token, crawledBody("b1")},
+		{"wrong token", "Bearer wrong", crawledBody("b1")},
+		{"token prefix", "Bearer " + token[:4], crawledBody("b1")},
+		{"token with suffix", "Bearer " + token + "x", crawledBody("b1")},
+		{"token with trailing space", "Bearer " + token + " ", crawledBody("b1")},
+		{"double space", "Bearer  " + token, crawledBody("b1")},
+		{"empty bearer", "Bearer ", crawledBody("b1")},
+		{"malformed body", "Bearer wrong", `{`},
+		{"non crawled operation", "Bearer wrong", `{"bookmarkId":"b1","operation":"edited"}`},
+		{"empty body", "", ``},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			notifier := &spyBookmarkNotifier{}
-			srv := newServer(t, notifier)
+			synctest.Test(t, func(t *testing.T) {
+				notifier := &spyBookmarkNotifier{}
+				srv := newServer(t, notifier)
 
-			rec := post(srv.Handler(), tt.authorization, crawledBody("b1"))
+				rec := post(srv.Handler(), tt.authorization, tt.body)
+				synctest.Wait()
 
-			if rec.Code != http.StatusUnauthorized {
-				t.Fatalf("status = %d, want 401", rec.Code)
-			}
-			if got := notifier.ids(); len(got) != 0 {
-				t.Fatalf("notifier handled %v, want nothing", got)
-			}
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("status = %d, want 401", rec.Code)
+				}
+				if got := notifier.ids(); len(got) != 0 {
+					t.Fatalf("notifier handled %v, want nothing", got)
+				}
+			})
 		})
 	}
 }
@@ -136,6 +146,7 @@ func TestWebhookFiltersOperationsAndMalformedBodies(t *testing.T) {
 		{"missing bookmark id", `{"operation":"crawled"}`, http.StatusBadRequest, 0},
 		{"empty bookmark id", `{"bookmarkId":"","operation":"crawled"}`, http.StatusBadRequest, 0},
 		{"missing bookmark id on other operation", `{"operation":"edited"}`, http.StatusBadRequest, 0},
+		{"oversized body", `{"bookmarkId":"b1","operation":"crawled","padding":"` + strings.Repeat("a", 2<<20) + `"}`, http.StatusBadRequest, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -239,12 +250,16 @@ func TestServeCancelsInFlightWorkAndShutsDown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Serve: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Serve did not return after cancel")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return promptly after cancel")
 	}
 	select {
 	case <-notifier.ctxDone:
 	default:
 		t.Fatal("in-flight notifier context was not canceled")
+	}
+	if conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second); err == nil {
+		conn.Close()
+		t.Fatal("server still accepts connections after shutdown")
 	}
 }

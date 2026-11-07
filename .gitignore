@@ -3,3 +3,4 @@ karakeep-tg-amd64
 karakeep-tg-arm64
 .env
 coverage.out
+env

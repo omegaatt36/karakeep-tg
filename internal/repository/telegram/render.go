@@ -1,7 +1,10 @@
 package telegram
 
 import (
+	"net/url"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/omegaatt36/karakeep-tg/domain"
 )
@@ -12,10 +15,10 @@ const (
 	pendingMarker = "⏳ 摘要尚未就緒"
 )
 
-var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
 
 func Render(msg domain.Message) string {
-	head := escaper.Replace(msg.URL)
+	head := `<a href="` + escaper.Replace(msg.URL) + `">` + escaper.Replace(displayURL(msg.URL)) + "</a>"
 	if msg.Title != "" {
 		head = "<b>" + escaper.Replace(msg.Title) + "</b>\n" + head
 	}
@@ -28,6 +31,18 @@ func Render(msg domain.Message) string {
 	default:
 		return head
 	}
+}
+
+func displayURL(raw string) string {
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || !utf8.ValidString(decoded) || strings.ContainsFunc(decoded, isUnsafeDisplayRune) {
+		return raw
+	}
+	return decoded
+}
+
+func isUnsafeDisplayRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.IsSpace(r)
 }
 
 func truncate(summary string, budget int) string {

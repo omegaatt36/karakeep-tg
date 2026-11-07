@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/omegaatt36/karakeep-tg/domain"
@@ -119,6 +120,43 @@ func TestNewRejectsMissingSettings(t *testing.T) {
 		if _, err := karakeep.New(args[0], args[1]); err == nil {
 			t.Errorf("New(%q, %q) succeeded, want error", args[0], args[1])
 		}
+	}
+}
+
+func TestNewRejectsUnsafeBaseURLs(t *testing.T) {
+	for _, raw := range []string{"ftp://example.com", "https://user:password@example.com", "https://example.com?token=x", "https://example.com#fragment"} {
+		if _, err := karakeep.New(raw, "key"); err == nil {
+			t.Errorf("New(%q) succeeded", raw)
+		}
+	}
+}
+
+func TestGetBookmarkRejectsPathControlBeforeRequest(t *testing.T) {
+	client, err := karakeep.New("http://127.0.0.1:1/prefix", "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"../../users", "%2e%2e%2fusers", "a/b", "..", "a?query", "a#fragment"} {
+		if _, err := client.GetBookmark(t.Context(), id); err == nil || !strings.Contains(err.Error(), "invalid bookmark id") {
+			t.Errorf("GetBookmark(%q) = %v, want validation error", id, err)
+		}
+	}
+}
+
+func TestGetBookmarkPreservesBasePath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/api/v1/bookmarks/abc-123" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		respond(http.StatusOK, `{"id":"abc-123","summarizationStatus":"success"}`)(w, r)
+	}))
+	defer server.Close()
+	client, err := karakeep.New(server.URL+"/prefix/", "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetBookmark(t.Context(), "abc-123"); err != nil {
+		t.Fatal(err)
 	}
 }
 

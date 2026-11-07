@@ -11,26 +11,90 @@ import (
 
 const (
 	messageLimit  = 4096
-	ellipsis      = "…"
 	pendingMarker = "⏳ 摘要尚未就緒"
 )
 
 var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
 
-func Render(msg domain.Message) string {
-	head := `<a href="` + escaper.Replace(msg.URL) + `">` + escaper.Replace(displayURL(msg.URL)) + "</a>"
+// Render splits a bookmark into independently valid HTML messages. Telegram's
+// limit applies to parsed text, so tag attributes and escaped entities do not
+// consume the text budget. Visible title, URL, and summary content is preserved; whitespace-only
+// chunks are omitted because Telegram rejects empty parsed messages.
+func Render(msg domain.Message) []string {
+	var builder messageBuilder
+	rawURL := strings.ToValidUTF8(msg.URL, "�")
 	if msg.Title != "" {
-		head = "<b>" + escaper.Replace(msg.Title) + "</b>\n" + head
+		builder.append(msg.Title, "<b>", "</b>")
+		builder.append("\n", "", "")
 	}
-
+	builder.append(displayURL(rawURL), `<a href="`+escaper.Replace(rawURL)+`">`, "</a>")
 	switch {
 	case msg.Summary != "":
-		return head + "\n\n" + truncate(msg.Summary, messageLimit-utf16Len(head)-len("\n\n"))
+		builder.append("\n\n"+msg.Summary, "", "")
 	case msg.SummaryPending:
-		return head + "\n\n" + pendingMarker
-	default:
-		return head
+		builder.append("\n\n"+pendingMarker, "", "")
 	}
+	return builder.finish()
+}
+
+type messageBuilder struct {
+	parts   []string
+	current strings.Builder
+	used    int
+	visible bool
+}
+
+func (b *messageBuilder) append(text, open, close string) {
+	text = strings.ToValidUTF8(text, "�")
+	if text == "" {
+		b.current.WriteString(open)
+		b.current.WriteString(close)
+	}
+	for len(text) > 0 {
+		end, units := 0, 0
+		for index := 0; index < len(text); {
+			r, size := utf8.DecodeRuneInString(text[index:])
+			width := 1
+			if r >= 0x10000 {
+				width = 2
+			}
+			if b.used+units+width > messageLimit {
+				break
+			}
+			index += size
+			end = index
+			units += width
+		}
+		if end > 0 {
+			b.current.WriteString(open)
+			b.current.WriteString(escaper.Replace(text[:end]))
+			b.current.WriteString(close)
+			if strings.ContainsFunc(text[:end], func(r rune) bool { return !unicode.IsSpace(r) }) {
+				b.visible = true
+			}
+			b.used += units
+			text = text[end:]
+		}
+		if len(text) > 0 {
+			b.flush()
+		}
+	}
+}
+
+func (b *messageBuilder) flush() {
+	if b.visible {
+		b.parts = append(b.parts, b.current.String())
+	}
+	b.current.Reset()
+	b.used = 0
+	b.visible = false
+}
+
+func (b *messageBuilder) finish() []string {
+	if b.current.Len() > 0 {
+		b.flush()
+	}
+	return b.parts
 }
 
 func displayURL(raw string) string {
@@ -43,35 +107,4 @@ func displayURL(raw string) string {
 
 func isUnsafeDisplayRune(r rune) bool {
 	return unicode.IsControl(r) || unicode.IsSpace(r)
-}
-
-func truncate(summary string, budget int) string {
-	escaped := escaper.Replace(summary)
-	if utf16Len(escaped) <= budget {
-		return escaped
-	}
-
-	budget -= utf16Len(ellipsis)
-	var b strings.Builder
-	used := 0
-	for _, r := range summary {
-		piece := escaper.Replace(string(r))
-		used += utf16Len(piece)
-		if used > budget {
-			break
-		}
-		b.WriteString(piece)
-	}
-	return b.String() + ellipsis
-}
-
-func utf16Len(s string) int {
-	n := 0
-	for _, r := range s {
-		n++
-		if r >= 0x10000 {
-			n++
-		}
-	}
-	return n
 }

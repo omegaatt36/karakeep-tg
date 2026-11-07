@@ -15,7 +15,7 @@ import (
 const requestTimeout = 10 * time.Second
 
 type Client struct {
-	baseURL    string
+	baseURL    *url.URL
 	apiKey     string
 	httpClient *http.Client
 }
@@ -25,12 +25,12 @@ func New(baseURL, apiKey string) (*Client, error) {
 		return nil, errors.New("api key is required")
 	}
 	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("invalid base url %q", baseURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, errors.New("base url must be an HTTP(S) URL without credentials, query, or fragment")
 	}
 
 	return &Client{
-		baseURL:    baseURL,
+		baseURL:    parsed,
 		apiKey:     apiKey,
 		httpClient: &http.Client{Timeout: requestTimeout},
 	}, nil
@@ -48,11 +48,11 @@ type bookmarkResponse struct {
 }
 
 func (c *Client) GetBookmark(ctx context.Context, id string) (domain.Bookmark, error) {
-	endpoint, err := url.JoinPath(c.baseURL, "api/v1/bookmarks", id)
-	if err != nil {
-		return domain.Bookmark{}, fmt.Errorf("build bookmark url: %w", err)
+	if !domain.ValidBookmarkID(id) {
+		return domain.Bookmark{}, errors.New("invalid bookmark id")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	endpoint := c.baseURL.JoinPath("api/v1/bookmarks", id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		return domain.Bookmark{}, fmt.Errorf("create bookmark request: %w", err)
 	}

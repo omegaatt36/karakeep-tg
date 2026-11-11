@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ const (
 type Sender struct {
 	bot         *bot.Bot
 	chatIDs     []string
+	karakeepURL *url.URL
 	mu          sync.Mutex
 	deliveries  map[string]*bookmarkDelivery
 	nextCleanup time.Time
@@ -38,10 +40,15 @@ type bookmarkDelivery struct {
 
 type chatDelivery struct {
 	// Keep the original snapshot on partial retry: a changed render cannot safely
-	// reuse an offset into the old content. Completed chats remain deduplicated.
+	// reuse an offset into the old content. Completed chats remain deduplicated
+	// unless a pending placeholder is being upgraded with the resolved summary.
 	parts       []string
+	replyMarkup models.ReplyMarkup
 	next        int
 	lastSuccess time.Time
+	messageID   int
+	pending     bool
+	editFirst   bool
 }
 
 func New(token string, chatIDs []string, opts ...bot.Option) (*Sender, error) {
@@ -55,6 +62,17 @@ func New(token string, chatIDs []string, opts ...bot.Option) (*Sender, error) {
 	return &Sender{bot: b, chatIDs: append([]string(nil), chatIDs...), deliveries: make(map[string]*bookmarkDelivery)}, nil
 }
 
+// WithKarakeepURL configures the base URL used to attach a Karakeep preview button
+// to outgoing messages.
+func (s *Sender) WithKarakeepURL(baseURL string) (*Sender, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, errors.New("karakeep url must be an HTTP(S) URL without credentials, query, or fragment")
+	}
+	s.karakeepURL = parsed
+	return s, nil
+}
+
 func (s *Sender) Send(ctx context.Context, msg domain.Message) error {
 	delivery, release, err := s.acquire(ctx, msg.BookmarkID)
 	if err != nil {
@@ -65,13 +83,24 @@ func (s *Sender) Send(ctx context.Context, msg domain.Message) error {
 	if len(parts) == 0 {
 		return errors.New("telegram message has no deliverable text")
 	}
+	var markup models.ReplyMarkup
+	if kb := InlineKeyboard(msg, s.karakeepURL); kb != nil {
+		markup = kb
+	}
 
 	var errs []error
 	for _, chatID := range s.chatIDs {
 		progress := delivery.chats[chatID]
-		if progress == nil || time.Since(progress.lastSuccess) >= deliveryTTL {
-			progress = &chatDelivery{parts: parts}
+		switch {
+		case progress == nil || time.Since(progress.lastSuccess) >= deliveryTTL:
+			progress = &chatDelivery{parts: parts, replyMarkup: markup, pending: msg.SummaryPending}
 			delivery.chats[chatID] = progress
+		case progress.pending && !msg.SummaryPending:
+			progress.parts = parts
+			progress.replyMarkup = markup
+			progress.next = 0
+			progress.pending = false
+			progress.editFirst = progress.messageID > 0
 		}
 		if err := s.sendChat(ctx, chatID, progress); err != nil {
 			slog.ErrorContext(ctx, "send telegram message", "chat_id", chatID, "bookmark_id", msg.BookmarkID, "part", progress.next+1, "error", err)
@@ -90,11 +119,30 @@ func (s *Sender) sendChat(ctx context.Context, chatID string, progress *chatDeli
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID:    parseChatID(chatID),
-			Text:      progress.parts[progress.next],
-			ParseMode: models.ParseModeHTML,
-		})
+		var partMarkup models.ReplyMarkup
+		if progress.next == len(progress.parts)-1 {
+			partMarkup = progress.replyMarkup
+		}
+		var (
+			sent *models.Message
+			err  error
+		)
+		if progress.next == 0 && progress.editFirst {
+			sent, err = s.bot.EditMessageText(ctx, &bot.EditMessageTextParams{
+				ChatID:      parseChatID(chatID),
+				MessageID:   progress.messageID,
+				Text:        progress.parts[0],
+				ParseMode:   models.ParseModeHTML,
+				ReplyMarkup: partMarkup,
+			})
+		} else {
+			sent, err = s.bot.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID:      parseChatID(chatID),
+				Text:        progress.parts[progress.next],
+				ParseMode:   models.ParseModeHTML,
+				ReplyMarkup: partMarkup,
+			})
+		}
 		if err != nil {
 			var rateLimit *bot.TooManyRequestsError
 			if !retriedRateLimit && errors.As(err, &rateLimit) && rateLimit.RetryAfter > 0 {
@@ -110,7 +158,12 @@ func (s *Sender) sendChat(ctx context.Context, chatID string, progress *chatDeli
 			}
 			return err
 		}
+		if progress.next == 0 && sent != nil && sent.ID > 0 {
+			progress.messageID = sent.ID
+		}
+		progress.editFirst = false
 		progress.next++
+		retriedRateLimit = false
 		// Only confirmed successful parts extend the TTL. A failed attempt never
 		// extends retention; partial deliveries expire one hour after their last
 		// successful part, completed deliveries after their final successful part.

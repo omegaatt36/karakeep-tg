@@ -6,12 +6,17 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/go-telegram/bot/models"
+
 	"github.com/omegaatt36/karakeep-tg/domain"
 )
 
 const (
-	messageLimit  = 4096
-	pendingMarker = "⏳ 摘要尚未就緒"
+	messageLimit        = 4096
+	pendingMarker       = "⏳ 摘要尚未就緒"
+	openOriginalLabel   = "🔗 開啟原文"
+	openKarakeepLabel   = "🗂 Karakeep"
+	karakeepPreviewPath = "dashboard/preview"
 )
 
 var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
@@ -107,4 +112,36 @@ func displayURL(raw string) string {
 
 func isUnsafeDisplayRune(r rune) bool {
 	return unicode.IsControl(r) || unicode.IsSpace(r)
+}
+
+// InlineKeyboard builds action buttons for the original article URL and, when
+// configured with a Karakeep base URL and valid bookmark ID, the Karakeep preview page.
+func InlineKeyboard(msg domain.Message, karakeepBaseURL *url.URL) *models.InlineKeyboardMarkup {
+	var buttons []models.InlineKeyboardButton
+	if validButtonURL(msg.URL) {
+		buttons = append(buttons, models.InlineKeyboardButton{
+			Text: openOriginalLabel,
+			URL:  msg.URL,
+		})
+	}
+	if karakeepBaseURL != nil && domain.ValidBookmarkID(msg.BookmarkID) {
+		buttons = append(buttons, models.InlineKeyboardButton{
+			Text: openKarakeepLabel,
+			URL:  karakeepBaseURL.JoinPath(karakeepPreviewPath, msg.BookmarkID).String(),
+		})
+	}
+	if len(buttons) == 0 {
+		return nil
+	}
+	return &models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{buttons},
+	}
+}
+
+func validButtonURL(raw string) bool {
+	if raw == "" || !utf8.ValidString(raw) || strings.ContainsFunc(raw, isUnsafeDisplayRune) {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
 }

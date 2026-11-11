@@ -21,6 +21,7 @@ const (
 type stubBookmarkSource struct {
 	mu        sync.Mutex
 	responses []domain.Bookmark
+	errs      map[int]error
 	err       error
 	calls     int
 	release   chan struct{}
@@ -28,9 +29,16 @@ type stubBookmarkSource struct {
 
 func (s *stubBookmarkSource) GetBookmark(ctx context.Context, id string) (domain.Bookmark, error) {
 	s.mu.Lock()
-	i := min(s.calls, len(s.responses)-1)
+	callIndex := s.calls
+	i := min(s.calls, max(len(s.responses)-1, 0))
 	s.calls++
 	release := s.release
+	callErr := s.err
+	if s.errs != nil {
+		if specific, ok := s.errs[callIndex]; ok {
+			callErr = specific
+		}
+	}
 	s.mu.Unlock()
 
 	if release != nil {
@@ -40,8 +48,8 @@ func (s *stubBookmarkSource) GetBookmark(ctx context.Context, id string) (domain
 			return domain.Bookmark{}, ctx.Err()
 		}
 	}
-	if s.err != nil {
-		return domain.Bookmark{}, s.err
+	if callErr != nil {
+		return domain.Bookmark{}, callErr
 	}
 	b := s.responses[i]
 	b.ID = id
@@ -380,11 +388,12 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		DedupeWindow:   dedupeWindow,
 	}
 	tests := map[string]func(*notify.Options){
-		"missing source":   func(o *notify.Options) { o.Source = nil },
-		"missing notifier": func(o *notify.Options) { o.Notifier = nil },
-		"zero interval":    func(o *notify.Options) { o.PollInterval = 0 },
-		"zero timeout":     func(o *notify.Options) { o.SummaryTimeout = 0 },
-		"zero window":      func(o *notify.Options) { o.DedupeWindow = 0 },
+		"missing source":    func(o *notify.Options) { o.Source = nil },
+		"missing notifier":  func(o *notify.Options) { o.Notifier = nil },
+		"zero interval":     func(o *notify.Options) { o.PollInterval = 0 },
+		"zero timeout":      func(o *notify.Options) { o.SummaryTimeout = 0 },
+		"negative followup": func(o *notify.Options) { o.FollowUpTimeout = -time.Second },
+		"zero window":       func(o *notify.Options) { o.DedupeWindow = 0 },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -395,4 +404,173 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandleFollowUpUpdatesPendingMessageWhenSummaryResolves(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &stubBookmarkSource{responses: []domain.Bookmark{
+			bookmark(domain.SummaryPending, ""),
+			bookmark(domain.SummaryPending, ""),
+			bookmark(domain.SummaryPending, ""),
+			bookmark(domain.SummarySuccess, "late summary"),
+		}}
+		notifier := &spyNotifier{}
+		svc, err := notify.New(notify.Options{
+			Source:          source,
+			Notifier:        notifier,
+			PollInterval:    pollInterval,
+			SummaryTimeout:  2 * pollInterval,
+			FollowUpTimeout: 3 * pollInterval,
+			DedupeWindow:    dedupeWindow,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+
+		got := notifier.messages()
+		if len(got) != 2 {
+			t.Fatalf("sent = %+v, want 2 messages (pending then resolved)", got)
+		}
+		if !got[0].SummaryPending || got[0].Summary != "" {
+			t.Errorf("first message = %+v, want pending placeholder", got[0])
+		}
+		if got[1].SummaryPending || got[1].Summary != "late summary" {
+			t.Errorf("second message = %+v, want resolved summary", got[1])
+		}
+
+		// Subsequent Handle within dedupe window should now be suppressed.
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("duplicate Handle: %v", err)
+		}
+		if len(notifier.messages()) != 2 {
+			t.Fatalf("sent %d messages after completion, want 2", len(notifier.messages()))
+		}
+	})
+}
+
+func TestHandleFollowUpTimeoutAndRetryPreservesPendingState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &stubBookmarkSource{responses: []domain.Bookmark{
+			bookmark(domain.SummaryPending, ""),
+		}}
+		notifier := &spyNotifier{}
+		svc, err := notify.New(notify.Options{
+			Source:          source,
+			Notifier:        notifier,
+			PollInterval:    pollInterval,
+			SummaryTimeout:  pollInterval,
+			FollowUpTimeout: pollInterval,
+			DedupeWindow:    dedupeWindow,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Both initial and follow-up timeouts expire with pending status; only 1 pending message is sent.
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("first Handle: %v", err)
+		}
+		if got := len(notifier.messages()); got != 1 || !notifier.messages()[0].SummaryPending {
+			t.Fatalf("after follow-up timeout sent = %+v, want 1 pending message", notifier.messages())
+		}
+
+		// A second Handle encounters ErrBookmarkNotFound during follow-up, releasing while preserving pending state.
+		source.mu.Lock()
+		source.errs = map[int]error{2: domain.ErrBookmarkNotFound}
+		source.calls = 0
+		source.mu.Unlock()
+		if err := svc.Handle(t.Context(), "b1"); !errors.Is(err, domain.ErrBookmarkNotFound) {
+			t.Fatalf("second Handle error = %v, want ErrBookmarkNotFound", err)
+		}
+		if got := len(notifier.messages()); got != 1 {
+			t.Fatalf("second Handle sent extra pending message: %+v", notifier.messages())
+		}
+	})
+}
+
+func TestHandleSubsequentCallUpgradesPreviouslyTimedOutPendingBookmark(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &stubBookmarkSource{responses: []domain.Bookmark{bookmark(domain.SummaryPending, "")}}
+		notifier := &spyNotifier{}
+		svc := newService(t, source, notifier)
+
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("first Handle: %v", err)
+		}
+		if got := len(notifier.messages()); got != 1 || !notifier.messages()[0].SummaryPending {
+			t.Fatalf("after timeout sent = %+v, want 1 pending message", notifier.messages())
+		}
+
+		source.mu.Lock()
+		source.responses = []domain.Bookmark{bookmark(domain.SummarySuccess, "resolved on replay")}
+		source.calls = 0
+		source.mu.Unlock()
+
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("second Handle: %v", err)
+		}
+		got := notifier.messages()
+		if len(got) != 2 || got[1].SummaryPending || got[1].Summary != "resolved on replay" {
+			t.Fatalf("after replay sent = %+v, want pending followed by resolved", got)
+		}
+
+		// Third call within dedupeWindow should be suppressed now that it resolved.
+		if err := svc.Handle(t.Context(), "b1"); err != nil {
+			t.Fatalf("third Handle: %v", err)
+		}
+		if len(notifier.messages()) != 2 {
+			t.Fatalf("third Handle sent extra message: %+v", notifier.messages())
+		}
+	})
+}
+
+func TestHandleToleratesTransientErrorsDuringPollingAndStopsOnNotFound(t *testing.T) {
+	t.Run("recovers from transient poll error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			source := &stubBookmarkSource{
+				responses: []domain.Bookmark{
+					bookmark(domain.SummaryPending, ""),
+					bookmark(domain.SummaryPending, ""),
+					bookmark(domain.SummarySuccess, "recovered summary"),
+				},
+				errs: map[int]error{
+					1: errors.New("temporary 502 bad gateway"),
+				},
+			}
+			notifier := &spyNotifier{}
+			if err := newService(t, source, notifier).Handle(t.Context(), "b1"); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			got := notifier.messages()
+			if len(got) != 1 || got[0].Summary != "recovered summary" {
+				t.Fatalf("sent = %+v, want recovered summary", got)
+			}
+		})
+	})
+
+	t.Run("stops immediately when bookmark is deleted during polling", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			source := &stubBookmarkSource{
+				responses: []domain.Bookmark{
+					bookmark(domain.SummaryPending, ""),
+					bookmark(domain.SummarySuccess, "unreachable"),
+				},
+				errs: map[int]error{
+					1: domain.ErrBookmarkNotFound,
+				},
+			}
+			notifier := &spyNotifier{}
+			err := newService(t, source, notifier).Handle(t.Context(), "b1")
+			if !errors.Is(err, domain.ErrBookmarkNotFound) {
+				t.Fatalf("Handle error = %v, want ErrBookmarkNotFound", err)
+			}
+			if got := len(notifier.messages()); got != 0 {
+				t.Fatalf("sent = %d, want 0", got)
+			}
+		})
+	})
 }

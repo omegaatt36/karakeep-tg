@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -12,7 +13,10 @@ import (
 	"github.com/omegaatt36/karakeep-tg/domain"
 )
 
-const requestTimeout = 10 * time.Second
+const (
+	requestTimeout   = 10 * time.Second
+	maxResponseBytes = 1 << 20
+)
 
 type Client struct {
 	baseURL    *url.URL
@@ -72,7 +76,7 @@ func (c *Client) GetBookmark(ctx context.Context, id string) (domain.Bookmark, e
 	}
 
 	var body bookmarkResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&body); err != nil {
 		return domain.Bookmark{}, fmt.Errorf("decode bookmark %s: %w", id, err)
 	}
 	return toBookmark(body)

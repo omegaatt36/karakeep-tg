@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"time"
 
 	"github.com/omegaatt36/karakeep-tg/internal/app"
 	"github.com/omegaatt36/karakeep-tg/internal/app/webhook"
@@ -14,8 +13,6 @@ import (
 	"github.com/omegaatt36/karakeep-tg/internal/repository/telegram"
 	"github.com/omegaatt36/karakeep-tg/internal/service/notify"
 )
-
-const dedupeWindow = time.Hour
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
@@ -43,12 +40,16 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create telegram sender: %w", err)
 	}
+	if _, err := sender.WithKarakeepURL(cfg.karakeepPublicURL); err != nil {
+		return fmt.Errorf("configure karakeep public url: %w", err)
+	}
 	notifier, err := notify.New(notify.Options{
-		Source:         source,
-		Notifier:       sender,
-		PollInterval:   cfg.summaryPollInterval,
-		SummaryTimeout: cfg.summaryTimeout,
-		DedupeWindow:   dedupeWindow,
+		Source:          source,
+		Notifier:        sender,
+		PollInterval:    cfg.summaryPollInterval,
+		SummaryTimeout:  cfg.summaryTimeout,
+		FollowUpTimeout: cfg.summaryFollowUpTimeout,
+		DedupeWindow:    cfg.dedupeWindow,
 	})
 	if err != nil {
 		return fmt.Errorf("create notify service: %w", err)
@@ -57,7 +58,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on port %s: %w", cfg.port, err)
 	}
-	server, err := webhook.New(webhook.Options{Token: cfg.webhookToken, Notifier: notifier})
+	server, err := webhook.New(webhook.Options{
+		Token:           cfg.webhookToken,
+		Notifier:        notifier,
+		WorkerCount:     cfg.webhookWorkers,
+		QueueCapacity:   cfg.webhookQueueSize,
+		ShutdownTimeout: cfg.shutdownTimeout,
+	})
 	if err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("create webhook server: %w", err)

@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -182,4 +183,36 @@ func TestRenderDropsWhitespaceOnlyParts(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestInlineKeyboard(t *testing.T) {
+	baseURL, err := url.Parse("https://keep.example.com/prefix")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("article and karakeep preview buttons", func(t *testing.T) {
+		kb := telegram.InlineKeyboard(domain.Message{
+			BookmarkID: "bm-123",
+			URL:        "https://example.com/article",
+		}, baseURL)
+		if kb == nil || len(kb.InlineKeyboard) != 1 || len(kb.InlineKeyboard[0]) != 2 {
+			t.Fatalf("keyboard = %+v, want 1 row with 2 buttons", kb)
+		}
+		if got := kb.InlineKeyboard[0][0]; got.Text != "🔗 開啟原文" || got.URL != "https://example.com/article" {
+			t.Errorf("first button = %+v", got)
+		}
+		if got := kb.InlineKeyboard[0][1]; got.Text != "🗂 Karakeep" || got.URL != "https://keep.example.com/prefix/dashboard/preview/bm-123" {
+			t.Errorf("second button = %+v", got)
+		}
+	})
+
+	t.Run("omits invalid urls and unsafe bookmark ids", func(t *testing.T) {
+		if kb := telegram.InlineKeyboard(domain.Message{BookmarkID: "../bad", URL: "   "}, baseURL); kb != nil {
+			t.Fatalf("keyboard = %+v, want nil", kb)
+		}
+		if kb := telegram.InlineKeyboard(domain.Message{BookmarkID: "bm-1", URL: "ftp://example.com"}, nil); kb != nil {
+			t.Fatalf("keyboard = %+v, want nil", kb)
+		}
+	})
 }

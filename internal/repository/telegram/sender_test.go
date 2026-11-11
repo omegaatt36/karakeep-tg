@@ -25,9 +25,20 @@ type sentMessage struct {
 	ParseMode string
 }
 
+type recordedRequest struct {
+	Path        string
+	ChatID      string
+	MessageID   string
+	Text        string
+	ParseMode   string
+	ReplyMarkup string
+}
+
 type spyBotAPI struct {
 	mu         sync.Mutex
 	sent       []sentMessage
+	reqs       []recordedRequest
+	nextMsgID  int
 	failChat   string
 	failText   string
 	failures   int
@@ -40,8 +51,19 @@ func (a *spyBotAPI) Do(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	body := sentMessage{ChatID: r.FormValue("chat_id"), Text: r.FormValue("text"), ParseMode: r.FormValue("parse_mode")}
+	req := recordedRequest{
+		Path:        r.URL.Path,
+		ChatID:      r.FormValue("chat_id"),
+		MessageID:   r.FormValue("message_id"),
+		Text:        r.FormValue("text"),
+		ParseMode:   r.FormValue("parse_mode"),
+		ReplyMarkup: r.FormValue("reply_markup"),
+	}
 	a.mu.Lock()
 	a.sent = append(a.sent, body)
+	a.reqs = append(a.reqs, req)
+	a.nextMsgID++
+	msgID := a.nextMsgID
 	fail := body.ChatID == a.failChat && (a.failText == "" || body.Text == a.failText) && a.failures != 0
 	if fail && a.failures > 0 {
 		a.failures--
@@ -52,7 +74,7 @@ func (a *spyBotAPI) Do(r *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
-	status, response := http.StatusOK, `{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":1,"type":"private"}}}`
+	status, response := http.StatusOK, fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"date":0,"chat":{"id":1,"type":"private"}}}`, msgID)
 	if fail {
 		status, response = http.StatusBadRequest, `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`
 		if a.retryAfter > 0 {
@@ -66,6 +88,12 @@ func (a *spyBotAPI) messages() []sentMessage {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return slices.Clone(a.sent)
+}
+
+func (a *spyBotAPI) requests() []recordedRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.reqs)
 }
 
 func (a *spyBotAPI) chats() []string {
@@ -433,5 +461,106 @@ func TestSendRejectsNoDeliverableParts(t *testing.T) {
 	}
 	if got := len(api.messages()); got != 0 {
 		t.Fatalf("sent %d empty messages", got)
+	}
+}
+
+func TestSendAttachesInlineKeyboardOnFinalPart(t *testing.T) {
+	api := &spyBotAPI{}
+	sender := newSender(t, api, []string{"111"})
+	if _, err := sender.WithKarakeepURL("https://keep.example.com"); err != nil {
+		t.Fatalf("WithKarakeepURL: %v", err)
+	}
+
+	msg := testMessage
+	msg.Summary = strings.Repeat("a", 5000)
+	if err := sender.Send(t.Context(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	reqs := api.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want 2", len(reqs))
+	}
+	if reqs[0].ReplyMarkup != "" {
+		t.Errorf("first part reply_markup = %q, want empty", reqs[0].ReplyMarkup)
+	}
+	if !strings.Contains(reqs[1].ReplyMarkup, "https://e.com/a") || !strings.Contains(reqs[1].ReplyMarkup, "https://keep.example.com/dashboard/preview/b1") {
+		t.Errorf("final part reply_markup = %q, want article and karakeep buttons", reqs[1].ReplyMarkup)
+	}
+}
+
+func TestWithKarakeepURLRejectsUnsafeURLs(t *testing.T) {
+	api := &spyBotAPI{}
+	sender := newSender(t, api, []string{"111"})
+	for _, bad := range []string{"", "ftp://keep.example.com", "https://user:pass@keep.example.com", "https://keep.example.com?x=1", "https://keep.example.com#frag"} {
+		if _, err := sender.WithKarakeepURL(bad); err == nil {
+			t.Errorf("WithKarakeepURL(%q) succeeded, want error", bad)
+		}
+	}
+}
+
+func TestSendEditsPendingMessageInPlaceWhenSummaryResolves(t *testing.T) {
+	api := &spyBotAPI{}
+	sender := newSender(t, api, []string{"111", "222"})
+	if _, err := sender.WithKarakeepURL("https://keep.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	pendingMsg := domain.Message{BookmarkID: "b1", Title: "Title", URL: "https://e.com/a", SummaryPending: true}
+	if err := sender.Send(t.Context(), pendingMsg); err != nil {
+		t.Fatalf("Send pending: %v", err)
+	}
+	// Duplicate pending replay should remain deduplicated.
+	if err := sender.Send(t.Context(), pendingMsg); err != nil {
+		t.Fatalf("Send duplicate pending: %v", err)
+	}
+
+	readyMsg := domain.Message{BookmarkID: "b1", Title: "Title", URL: "https://e.com/a", Summary: "final summary"}
+	if err := sender.Send(t.Context(), readyMsg); err != nil {
+		t.Fatalf("Send resolved: %v", err)
+	}
+	// Subsequent completed replay should also be deduplicated.
+	if err := sender.Send(t.Context(), readyMsg); err != nil {
+		t.Fatalf("Send duplicate resolved: %v", err)
+	}
+
+	reqs := api.requests()
+	if len(reqs) != 4 {
+		t.Fatalf("requests = %d, want 4 (2 initial sends + 2 in-place edits)", len(reqs))
+	}
+	if reqs[0].Path != "/bottoken/sendMessage" || reqs[1].Path != "/bottoken/sendMessage" {
+		t.Fatalf("initial paths = %q, %q, want /bottoken/sendMessage", reqs[0].Path, reqs[1].Path)
+	}
+	if reqs[2].Path != "/bottoken/editMessageText" || reqs[2].ChatID != "111" || reqs[2].MessageID != "1" || !strings.Contains(reqs[2].Text, "final summary") {
+		t.Fatalf("first edit = %+v", reqs[2])
+	}
+	if reqs[3].Path != "/bottoken/editMessageText" || reqs[3].ChatID != "222" || reqs[3].MessageID != "2" || !strings.Contains(reqs[3].Text, "final summary") {
+		t.Fatalf("second edit = %+v", reqs[3])
+	}
+}
+
+func TestSendEditsFirstPartAndSendsOverflowPartsWhenResolvedSummaryIsLong(t *testing.T) {
+	api := &spyBotAPI{}
+	sender := newSender(t, api, []string{"111"})
+
+	pendingMsg := domain.Message{BookmarkID: "b1", Title: "Title", URL: "https://e.com/a", SummaryPending: true}
+	if err := sender.Send(t.Context(), pendingMsg); err != nil {
+		t.Fatalf("Send pending: %v", err)
+	}
+
+	readyMsg := domain.Message{BookmarkID: "b1", Title: "Title", URL: "https://e.com/a", Summary: strings.Repeat("x", 5000)}
+	if err := sender.Send(t.Context(), readyMsg); err != nil {
+		t.Fatalf("Send long resolved: %v", err)
+	}
+
+	reqs := api.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests = %d, want 3 (1 initial send + 1 edit + 1 overflow send)", len(reqs))
+	}
+	if reqs[1].Path != "/bottoken/editMessageText" || reqs[1].MessageID != "1" || reqs[1].ReplyMarkup != "" {
+		t.Fatalf("edited part 0 = %+v, want editMessageText with cleared reply_markup", reqs[1])
+	}
+	if reqs[2].Path != "/bottoken/sendMessage" || reqs[2].ReplyMarkup == "" {
+		t.Fatalf("overflow part 1 = %+v, want sendMessage with reply_markup on final part", reqs[2])
 	}
 }

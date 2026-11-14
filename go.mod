@@ -2,7 +2,7 @@ module github.com/omegaatt36/karakeep-tg
 
 go 1.27.3
 
-require github.com/go-telegram/bot v1.27.0
+require github.com/go-telegram/bot v1.28.0
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.4.0 // indirect
